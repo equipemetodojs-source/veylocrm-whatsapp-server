@@ -38,7 +38,7 @@ function findChromePath() {
 }
 
 const app = express();
-const port = Number(process.env.WHATSAPP_QR_PORT || 3030);
+const port = Number(process.env.PORT || process.env.WHATSAPP_QR_PORT || 3030);
 const clientId = "veylocrm";
 const authPath = path.resolve(process.cwd(), ".wwebjs_auth");
 
