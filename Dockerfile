@@ -1,13 +1,17 @@
-FROM ghcr.io/puppeteer/puppeteer:24.0.0
+FROM node:20-slim
 
-USER pptruser
+# Install dependencies for Baileys
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-COPY --chown=pptruser:pptruser package.json ./
+COPY package.json ./
 RUN npm install --omit=dev
 
-COPY --chown=pptruser:pptruser whatsapp-webjs-server.cjs ./
-RUN mkdir -p /app/.wwebjs_auth
+COPY server.cjs ./
 
-EXPOSE 3030
-CMD ["node", "whatsapp-webjs-server.cjs"]
+EXPOSE 3001
+
+CMD ["node", "server.cjs"]

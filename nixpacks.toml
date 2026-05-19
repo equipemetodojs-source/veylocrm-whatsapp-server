@@ -1,5 +1,0 @@
-[phases.setup]
-nixPkgs = ["ffmpeg"]
-
-[env]
-PUPPETEER_CACHE_DIR = "/app/.cache/puppeteer"
