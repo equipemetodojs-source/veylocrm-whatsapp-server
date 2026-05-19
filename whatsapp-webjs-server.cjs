@@ -14,6 +14,16 @@ function findChromePath() {
   if (envPath) {
     try { if (require("fs").existsSync(envPath)) return envPath; } catch {}
   }
+  // Linux paths (Docker)
+  const linuxPaths = [
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+  ];
+  for (const p of linuxPaths) {
+    try { if (require("fs").existsSync(p)) return p; } catch {}
+  }
   // Windows paths
   const winPaths = [
     "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
