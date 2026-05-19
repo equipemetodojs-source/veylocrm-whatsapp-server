@@ -1,9 +1,0 @@
-[build]
-builder = "dockerfile"
-
-[deploy]
-startCommand = "node whatsapp-webjs-server.cjs"
-healthcheckPath = "/api/health"
-healthcheckTimeout = 300
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 10
