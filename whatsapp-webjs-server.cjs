@@ -308,10 +308,17 @@ const BR_DDDS = new Set([
   "71","73","74","75","77","79","81","82","83","84","85","86","87","88","89",
   "91","92","93","94","95","96","97","98","99",
 ]);
+const COUNTRY_CODES = [
+  "55","1","44","34","33","49","39","351","52","54","56","57","51",
+  "593","598","91","86","81","82","62","63","66","84","61","64",
+  "27","234","254","966","971",
+].sort((a, b) => b.length - a.length);
 function normalizeConvPhone(raw) {
   const d = String(raw).replace(/\D/g, "");
   if (!d) return raw;
-  if (d.startsWith("55") && d.length >= 12) return d;
+  for (const code of COUNTRY_CODES) {
+    if (d.startsWith(code) && d.length >= code.length + 6) return d;
+  }
   if (d.length === 11 && BR_DDDS.has(d.substring(0, 2))) return "55" + d;
   if (d.length === 10 && BR_DDDS.has(d.substring(0, 2))) return "55" + d;
   return d;
