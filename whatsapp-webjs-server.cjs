@@ -38,7 +38,7 @@ function findChromePath() {
 }
 
 const app = express();
-const port = Number(process.env.PORT || process.env.WHATSAPP_QR_PORT || 3030);
+const port = Number(process.env.WHATSAPP_QR_PORT || 3030);
 const clientId = "veylocrm";
 const authPath = path.resolve(process.cwd(), ".wwebjs_auth");
 
@@ -316,9 +316,16 @@ const COUNTRY_CODES = [
 function normalizeConvPhone(raw) {
   const d = String(raw).replace(/\D/g, "");
   if (!d) return raw;
+  // Check multi-digit country codes first (skip US/1 and BR/55)
   for (const code of COUNTRY_CODES) {
+    if (code === "1" || code === "55") continue;
     if (d.startsWith(code) && d.length >= code.length + 6) return d;
   }
+  // Already has Brazil country code
+  if (d.startsWith("55") && d.length >= 12) return d;
+  // US/Canada: starts with 1, 11 digits
+  if (d.startsWith("1") && d.length === 11) return d;
+  // Brazilian numbers without country code
   if (d.length === 11 && BR_DDDS.has(d.substring(0, 2))) return "55" + d;
   if (d.length === 10 && BR_DDDS.has(d.substring(0, 2))) return "55" + d;
   return d;
