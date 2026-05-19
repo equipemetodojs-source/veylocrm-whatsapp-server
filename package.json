@@ -1,0 +1,12 @@
+{
+  "name": "veycrm-whatsapp-server",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.34.7"
+  }
+}
