@@ -1369,6 +1369,47 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+// ── Fetch all WhatsApp contacts for CRM import ──
+app.get("/api/contacts", async (_req, res) => {
+  try {
+    if (!client || status !== "ready") return res.status(503).json({ error: "nao_conectado" });
+    const contacts = await getContactCache();
+    const result = [];
+    for (const c of contacts) {
+      const id = c.id?._serialized || "";
+      if (id.endsWith("@g.us") || id === "status@broadcast") continue;
+      const rawUser = id.replace(/@(c\.us|lid)$/, "");
+      const isLid = id.endsWith("@lid");
+      let phone = c.number || rawUser;
+      phone = phone.replace(/@(c\.us|lid)$/, "");
+
+      // For LID contacts, try to resolve real phone
+      if (isLid && phone === rawUser) {
+        const resolved = await resolveLidToPhone(rawUser);
+        if (resolved) phone = resolved.replace(/\D/g, "");
+      }
+
+      const name = c.pushname || c.name || c.shortName || "";
+      const avatarUrl = c.getProfilePicUrl ? await c.getProfilePicUrl().catch(() => null) : null;
+
+      // Normalize phone number before sending to client
+      const normalizedPhone = normalizeConvPhone(phone);
+
+      result.push({
+        id: normalizedPhone ? `${normalizedPhone}@c.us` : id,
+        phone: normalizedPhone || phone,
+        name,
+        isLid,
+        avatarUrl,
+      });
+    }
+    res.json({ contacts: result, total: result.length });
+  } catch (err) {
+    log("error", "Erro ao buscar contatos", err?.message);
+    res.status(500).json({ error: "erro_interno" });
+  }
+});
+
 // ── Start ──
 app.listen(port, "0.0.0.0", () => {
   log("info", `Servidor WhatsApp (web.js) em http://0.0.0.0:${port}`);
