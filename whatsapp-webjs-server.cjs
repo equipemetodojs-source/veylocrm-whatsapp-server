@@ -4,7 +4,16 @@ const fs = require("fs/promises");
 const path = require("path");
 const { execSync, execFile } = require("child_process");
 const qrcode = require("qrcode");
-const ffmpegPath = require("@ffmpeg-installer/ffmpeg").path;
+// Use system ffmpeg if available, fallback to npm package
+let ffmpegPath;
+try {
+  const fsSync = require("fs");
+  if (fsSync.existsSync("/usr/local/bin/ffmpeg")) {
+    ffmpegPath = "/usr/local/bin/ffmpeg";
+  } else {
+    ffmpegPath = require("@ffmpeg-installer/ffmpeg").path;
+  }
+} catch { ffmpegPath = "ffmpeg"; }
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 
 // Auto-detect Chrome/Chromium
@@ -43,7 +52,7 @@ const clientId = "veylocrm";
 const authPath = path.resolve(process.cwd(), ".wwebjs_auth");
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 let client = null;
 let status = "initializing";
@@ -56,6 +65,14 @@ let isInitializing = false;
 
 const conversations = new Map();
 const events = [];
+const sseClients = new Set();
+
+function broadcastSSE(conversationId, conversation) {
+  const data = JSON.stringify({ conversationId, conversation });
+  for (const res of sseClients) {
+    try { res.write(`data: ${data}\n\n`); } catch { sseClients.delete(res); }
+  }
+}
 
 // ── Flow engine state ──
 const flows = new Map();              // flowId → Flow
@@ -73,12 +90,12 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // Simulate human typing indicator before sending
 async function simulateTyping(chatId, typingMs) {
-  if (!client || !typingMs || typingMs < 500) return;
+  if (!client || !typingMs || typingMs < 100) return;
   try {
     await client.sendPresenceUpdate("composing", chatId);
-    await sleep(Math.min(typingMs, 25000));
+    await sleep(Math.min(typingMs, 3000));
     await client.sendPresenceUpdate("paused", chatId).catch(() => {});
-    await sleep(300 + Math.random() * 700); // Brief pause after "typing"
+    await sleep(100);
   } catch {
     try { await client.sendPresenceUpdate("paused", chatId); } catch {}
   }
@@ -430,6 +447,9 @@ async function startClient() {
       lastError = null;
       connectedNumber = client?.info?.wid?.user || null;
       log("info", `WhatsApp conectado: ${connectedNumber}`);
+      // Clear old conversations from previous session
+      conversations.clear();
+      log("info", "Conversas anteriores limpas");
       // Give a moment for encryption to sync
       setTimeout(() => {
         if (status === "ready") {
@@ -461,6 +481,14 @@ async function startClient() {
     });
 
     client.on("message", async (message) => {
+      // Filter: ignore messages not for the connected number
+      if (connectedNumber) {
+        const myJid = connectedNumber + "@c.us";
+        const toStr = typeof message.to === "string" ? message.to : message.to?._serialized || "";
+        const fromStr = typeof message.from === "string" ? message.from : message.from?._serialized || "";
+        // Only allow if matches connected number's phone JID
+        if (toStr !== myJid) return;
+      }
       const chatId = message.from;
       const isNew = !conversations.has(chatId) && !conversations.has(normalizeConvPhone(chatId) + "@c.us");
       await ingestMessage(message, "lead");
@@ -477,7 +505,15 @@ async function startClient() {
     });
 
     client.on("message_create", async (message) => {
-      if (message.fromMe) await ingestMessage(message, "agent");
+      if (message.fromMe) {
+        // Filter: ignore messages sent by other linked numbers
+        if (connectedNumber) {
+          const myJid = connectedNumber + "@c.us";
+          const fromStr = typeof message.from === "string" ? message.from : message.from?._serialized || "";
+          if (fromStr !== myJid) return;
+        }
+        await ingestMessage(message, "agent");
+      }
     });
 
     log("info", "Inicializando WhatsApp Web...");
@@ -556,7 +592,92 @@ async function resolveLidToPhone(lid) {
     }
   } catch {}
 
+  // Approach 2: Search contact cache by LID match (broad search)
+  try {
+    const contacts = await getContactCache();
+    for (const c of contacts) {
+      const cId = c.id?._serialized || "";
+      const cIdUser = cId.replace(/@(c\.us|lid)$/, "");
+      // Match by LID user ID
+      if (cIdUser === lid && c.number && c.number.replace(/\D/g, "").length >= 10) {
+        return c.number;
+      }
+      // Also try: if contact has this LID and a valid phone
+      if (c.id?._serialized?.startsWith(lid) && c.number && c.number.replace(/\D/g, "").length >= 10) {
+        return c.number;
+      }
+    }
+  } catch {}
+
+  // Approach 3: Search conversations map for matching name with real phone
+  try {
+    const lidConv = conversations.get(lid + "@c.us") || conversations.get(lid + "@lid");
+    if (lidConv?.name) {
+      const searchName = normalizeNameForMatch(lidConv.name);
+      for (const [, c] of conversations) {
+        if (c.handle && c.name && normalizeNameForMatch(c.name) === searchName) {
+          const clean = c.handle.replace(/\D/g, "");
+          if (clean.length >= 10 && clean.length <= 13) return c.handle;
+        }
+      }
+    }
+  } catch {}
+
+  // Approach 4: Use Puppeteer to query WhatsApp internal contact map more aggressively
+  try {
+    const result = await client.pupPage.evaluate((lidStr) => {
+      try {
+        // Try to access the internal contact module directly
+        const modules = window.__webpack_modules__ || {};
+        for (const key of Object.keys(modules)) {
+          const mod = modules[key];
+          if (mod?.exports?.default?.get) {
+            const store = mod.exports.default;
+            // Try to find contact by LID
+            const contact = store.get(lidStr + "@lid");
+            if (contact) {
+              if (contact.number) return String(contact.number);
+              if (contact.phoneNumber) return String(contact.phoneNumber);
+              // Try to get phone from chat
+              if (contact.chat?.id?.user && !String(contact.chat.id.user).includes("@lid")) {
+                return String(contact.chat.id.user);
+              }
+            }
+          }
+        }
+        // Try window.Store with different access patterns
+        const Store = window.Store || {};
+        const contactKeys = Object.keys(Store).filter(k => k.toLowerCase().includes('contact'));
+        for (const key of contactKeys) {
+          const storeObj = Store[key];
+          if (storeObj && typeof storeObj.get === 'function') {
+            const c = storeObj.get(lidStr + "@lid");
+            if (c) {
+              if (c.number) return String(c.number);
+              if (c.phoneNumber) return String(c.phoneNumber);
+            }
+          }
+        }
+      } catch {}
+      return null;
+    }, lid);
+    if (result && !String(result).endsWith("@lid")) {
+      return String(result);
+    }
+  } catch {}
+
   return null;
+}
+
+// Normalize name for matching: remove accents, prefixes, extra spaces
+function normalizeNameForMatch(name) {
+  return (name || "")
+    .toLowerCase()
+    .trim()
+    .normalize("NFD").replace(/[̀-ͯ]/g, "") // remove accents
+    .replace(/^(dra\.?|dr\.?|clinic[aoa]\s*|consultor[io]+\s*|esp\.?\s*)/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // Resolve LID contacts to phone numbers by name matching against @c.us contacts
@@ -564,32 +685,40 @@ async function resolveLidByName(contactName) {
   if (!client || !contactName) return null;
   try {
     const contacts = await getContactCache();
-    const searchName = contactName.toLowerCase().trim();
+    const searchName = normalizeNameForMatch(contactName);
+    if (!searchName) return null;
 
-    // Helper: check if a number looks like a real phone number (not a LID)
     const isRealPhone = (num) => {
       const d = String(num).replace(/\D/g, "");
       return d.length >= 10 && d.length <= 13;
     };
 
-    // First pass: exact match with REAL phone number
-    for (const c of contacts) {
-      if (c.id?._serialized?.endsWith("@c.us") && c.number && isRealPhone(c.number)) {
-        const cName = (c.pushname || c.name || "").toLowerCase().trim();
-        if (cName && cName === searchName) return c.number;
-      }
+    // Build list of @c.us contacts with real phones
+    const cusContacts = contacts.filter(c =>
+      c.id?._serialized?.endsWith("@c.us") && c.number && isRealPhone(c.number)
+    );
+
+    // Pass 1: exact normalized match
+    for (const c of cusContacts) {
+      const cName = normalizeNameForMatch(c.pushname || c.name || "");
+      if (cName && cName === searchName) return c.number;
     }
-    // Second pass: partial match with REAL phone number
-    for (const c of contacts) {
-      if (c.id?._serialized?.endsWith("@c.us") && c.number && isRealPhone(c.number)) {
-        const cName = (c.pushname || c.name || "").toLowerCase().trim();
-        if (cName && searchName && (cName.includes(searchName) || searchName.includes(cName))) return c.number;
-      }
+    // Pass 2: one includes the other
+    for (const c of cusContacts) {
+      const cName = normalizeNameForMatch(c.pushname || c.name || "");
+      if (cName && (cName.includes(searchName) || searchName.includes(cName))) return c.number;
     }
-    // Third pass: any match (including LID numbers, better than nothing)
+    // Pass 3: token match — first significant word matches
+    const searchTokens = searchName.split(" ").filter(t => t.length > 2);
+    for (const c of cusContacts) {
+      const cName = normalizeNameForMatch(c.pushname || c.name || "");
+      const cTokens = cName.split(" ").filter(t => t.length > 2);
+      if (searchTokens.length > 0 && cTokens.length > 0 && searchTokens[0] === cTokens[0]) return c.number;
+    }
+    // Pass 4: any @c.us contact with same normalized name (even without real phone)
     for (const c of contacts) {
       if (c.id?._serialized?.endsWith("@c.us") && c.number) {
-        const cName = (c.pushname || c.name || "").toLowerCase().trim();
+        const cName = normalizeNameForMatch(c.pushname || c.name || "");
         if (cName && cName === searchName) return c.number;
       }
     }
@@ -644,6 +773,9 @@ async function resolveContact(rawJid, contact, pushName, chatName) {
     } catch {}
   }
 
+  // If still a LID after all resolution attempts, mark as unresolved
+  const isLidUnresolved = isLid && (!phone || phone === rawUser || phone.length >= 14);
+
   // Fallback name: pushName from message > chat name
   if (!displayName) displayName = pushName || chatName || "";
 
@@ -669,17 +801,61 @@ async function resolveContact(rawJid, contact, pushName, chatName) {
     } catch {}
   }
 
-  return { phone, displayName, avatarUrl, chatId: rawJid, isLid };
+  return { phone, displayName, avatarUrl, chatId: rawJid, isLid, isLidUnresolved };
+}
+
+// Check if a chat belongs to the connected WhatsApp number
+async function isChatFromConnectedNumber(chat) {
+  if (!connectedNumber) return true;
+  const myJid = connectedNumber + "@c.us";
+  try {
+    const messages = await chat.fetchMessages({ limit: 5 });
+    if (!messages || messages.length === 0) return true;
+    let hasCusMatch = false;
+    let hasLidOnly = false;
+    for (const msg of messages) {
+      const fromStr = typeof msg.from === "string" ? msg.from : msg.from?._serialized || "";
+      const toStr = typeof msg.to === "string" ? msg.to : msg.to?._serialized || "";
+      if (fromStr === myJid || toStr === myJid) hasCusMatch = true;
+      if (fromStr.endsWith("@lid") || toStr.endsWith("@lid")) hasLidOnly = true;
+    }
+    // Verified match with connected number's phone
+    if (hasCusMatch) return true;
+    // LID-only chat: cannot determine which number it belongs to - exclude
+    return false;
+  } catch { return true; }
 }
 
 async function hydrateRecentChats() {
   try {
     if (!client) return;
     const chats = await client.getChats();
-    const nonGroup = chats.filter(c => !c.isGroup && c.id?._serialized && !c.id._serialized.endsWith("@g.us") && c.id._serialized !== "status@broadcast");
+    // Filter: non-group, non-broadcast, non-system contacts
+    const SYSTEM_NAMES = ["meta ai", "whatsapp official", "whatsapp", "telegram", "instagram"];
+    const nonGroup = chats.filter(c => {
+      if (c.isGroup) return false;
+      const id = c.id?._serialized || "";
+      if (id.endsWith("@g.us") || id === "status@broadcast") return false;
+      // Filter out known system/bot contacts
+      const name = (c.name || "").toLowerCase().trim();
+      if (SYSTEM_NAMES.some(s => name === s || name.startsWith(s))) return false;
+      // Filter out contacts with suspicious IDs (Meta AI uses specific patterns)
+      if (id.includes("meta") || id.includes("ai")) return false;
+      return true;
+    });
     log("info", `Total de conversas disponiveis: ${nonGroup.length}`);
 
-    for (const chat of nonGroup.slice(0, 100)) {
+    // Filter: only chats from the connected number (parallel batches)
+    const BATCH = 20;
+    const ownChats = [];
+    for (let i = 0; i < nonGroup.length; i += BATCH) {
+      const batch = nonGroup.slice(i, i + BATCH);
+      const results = await Promise.all(batch.map(c => isChatFromConnectedNumber(c)));
+      batch.forEach((c, j) => { if (results[j]) ownChats.push(c); });
+    }
+    log("info", `Conversas do numero conectado (${connectedNumber}): ${ownChats.length}/${nonGroup.length}`);
+
+    for (const chat of ownChats.slice(0, 80)) {
       const rawId = chat.id?._serialized || "";
 
       const contact = await chat.getContact().catch(() => null);
@@ -694,10 +870,10 @@ async function hydrateRecentChats() {
 
       conv.name = displayName || chat.name || phone;
       conv.handle = phone;
-      conv.chatId = chatId;
+      conv.chatId = convId; // Use normalized phone JID, not raw LID JID
       if (avatarUrl) conv.avatarUrl = avatarUrl;
 
-      const messages = await chat.fetchMessages({ limit: 30 }).catch(() => []);
+      const messages = await chat.fetchMessages({ limit: 10 }).catch(() => []);
       for (const msg of messages) {
         const msgId = msg.id?._serialized || `${convId}-${Date.now()}`;
         if (conv.messages.some(m => m.id === msgId)) continue;
@@ -706,39 +882,12 @@ async function hydrateRecentChats() {
         let mediaUrl = null;
         let mediaMime = null;
 
-        // Download media for history messages
+        // Skip media download during hydration — just show placeholder
         if (msg.hasMedia) {
-          try {
-            const isVoice = msg.type === "ptt";
-            const isAudio = msg.type === "audio";
-
-            if (isVoice && msg.body && msg.body.length > 200) {
-              const mime = msg.mimetype || "audio/ogg; codecs=opus";
-              mediaUrl = `data:${mime};base64,${msg.body}`;
-              mediaMime = mime;
-              text = "\u{1F3A4} Audio";
-            } else {
-              const media = await msg.downloadMedia();
-              if (media && media.data) {
-                mediaUrl = `data:${media.mimetype};base64,${media.data}`;
-                mediaMime = media.mimetype;
-                if (isVoice || isAudio) {
-                  text = "\u{1F3A4} Audio";
-                } else if (media.mimetype?.startsWith("image/")) {
-                  text = msg.body || "\u{1F4F7} Foto";
-                } else if (media.mimetype?.startsWith("video/")) {
-                  text = msg.body || "\u{1F3AC} Video";
-                } else {
-                  text = msg.body || "\u{1F4CE} Documento";
-                }
-              }
-            }
-          } catch {
-            if (msg.type === "ptt" || msg.type === "audio") text = "\u{1F3A4} Audio";
-            else if (msg.type === "image") text = "\u{1F4F7} Foto";
-            else if (msg.type === "video") text = "\u{1F3AC} Video";
-            else if (msg.type === "document") text = "\u{1F4CE} Documento";
-          }
+          if (msg.type === "ptt" || msg.type === "audio") text = "\u{1F3A4} Audio";
+          else if (msg.type === "image") text = msg.body || "\u{1F4F7} Foto";
+          else if (msg.type === "video") text = msg.body || "\u{1F3AC} Video";
+          else if (msg.type === "document") text = msg.body || "\u{1F4CE} Documento";
         }
 
         conv.messages.push({
@@ -751,6 +900,7 @@ async function hydrateRecentChats() {
           mediaMime,
         });
       }
+      conv.messages.sort((a, b) => (a.ts || 0) - (b.ts || 0));
       conv.messages = conv.messages.slice(-80);
       const lastMsg = conv.messages.at(-1);
       conv.lastTs = lastMsg ? (lastMsg.ts || 0) : 0;
@@ -764,8 +914,21 @@ async function hydrateRecentChats() {
 
 async function ingestMessage(message, fallbackFrom, announce = true, extraAudioUrl = null) {
   try {
+    // Filter: only ingest messages involving the connected number
+    if (connectedNumber) {
+      const myJid = connectedNumber + "@c.us";
+      const fromStr = typeof message.from === "string" ? message.from : message.from?._serialized || "";
+      const toStr = typeof message.to === "string" ? message.to : message.to?._serialized || "";
+      if (message.fromMe) {
+        // Outgoing: from must be connected number
+        if (fromStr !== myJid) { log("debug", `Msg descartada (from mismatch): from=${fromStr} myJid=${myJid}`); return; }
+      } else {
+        // Incoming: to must be connected number
+        if (toStr !== myJid) { log("debug", `Msg descartada (to mismatch): to=${toStr} myJid=${myJid}`); return; }
+      }
+    }
     const rawChatId = message.fromMe ? message.to : message.from;
-    if (!rawChatId || rawChatId.endsWith("@g.us") || rawChatId === "status@broadcast") return;
+    if (!rawChatId || rawChatId.endsWith("@g.us") || rawChatId === "status@broadcast") { log("debug", `Msg descartada (group/broadcast): rawChatId=${rawChatId}`); return; }
 
     const contact = await message.getContact().catch(() => null);
     const { phone, displayName, avatarUrl, chatId } = await resolveContact(rawChatId, contact, message.pushName, null);
@@ -774,7 +937,7 @@ async function ingestMessage(message, fallbackFrom, announce = true, extraAudioU
     const finalName = displayName || message.pushName || phone;
 
     const conv = conversations.get(convId) || {
-      id: convId, chatId, name: finalName, handle: phone,
+      id: convId, chatId: convId, name: finalName, handle: phone,
       avatarUrl: avatarUrl || null, channel: "WhatsApp",
       status: "novo", stage: "Novo", owner: "Ninguem",
       unread: 0, lastSeen: "", value: "", tags: [], messages: [],
@@ -782,7 +945,7 @@ async function ingestMessage(message, fallbackFrom, announce = true, extraAudioU
 
     conv.name = finalName;
     conv.handle = phone;
-    conv.chatId = chatId;
+    conv.chatId = convId;
     if (avatarUrl) conv.avatarUrl = avatarUrl;
     conv.lastSeen = new Date((message.timestamp || Date.now() / 1000) * 1000).toLocaleString("pt-BR");
 
@@ -848,6 +1011,8 @@ async function ingestMessage(message, fallbackFrom, announce = true, extraAudioU
     if (!message.fromMe && announce) conv.unread = (conv.unread || 0) + 1;
     conv.messages = conv.messages.slice(-80);
     conversations.set(convId, conv);
+    broadcastSSE(convId, { ...conv, messages: [...conv.messages].sort((a, b) => (a.ts || 0) - (b.ts || 0)).slice(-30) });
+    log("info", `Msg ingerida: ${message.fromMe ? "enviada" : "recebida"} -> ${convId} (${conv.name}) [SSE: ${sseClients.size} clientes]`);
   } catch (err) {
     // swallow - don't crash on message ingestion
   }
@@ -867,9 +1032,12 @@ async function resolveAllLids() {
   let resolved = 0;
   let attempted = 0;
   for (const [convId, conv] of conversations) {
-    if (conv.chatId?.endsWith("@lid")) {
+    // Check if the conversation KEY looks like a LID (14+ digits or ends with @lid)
+    const keyDigits = (convId || "").replace(/\D/g, "");
+    const isLidKey = convId.endsWith("@lid") || keyDigits.length >= 14;
+    if (isLidKey) {
       attempted++;
-      const lid = conv.chatId.replace("@lid", "");
+      const lid = keyDigits;
 
       // Try Puppeteer Store first
       let phone = await resolveLidToPhone(lid);
@@ -901,6 +1069,7 @@ async function resolveAllLids() {
           if (normalizedConvId !== convId) {
             conversations.delete(convId);
             conv.id = normalizedConvId;
+            conv.chatId = normalizedConvId; // Update chatId from LID to phone JID
             conversations.set(normalizedConvId, conv);
           }
           conv.handle = cleanPhone;
@@ -938,11 +1107,25 @@ app.get("/api/qr", (_req, res) => {
 });
 
 app.get("/api/conversations", (_req, res) => {
-  const list = Array.from(conversations.values()).sort((a, b) => {
-    const at = a.lastTs || 0;
-    const bt = b.lastTs || 0;
-    return bt - at;
-  });
+  const list = Array.from(conversations.values())
+    .filter(c => {
+      const handle = c.handle || "";
+      const clean = handle.replace(/\D/g, "");
+      // Only show conversations with a real phone number (not raw LID)
+      if (clean.length >= 14) return false; // LID — skip
+      if (clean.length < 10) return false; // Too short — skip
+      return true;
+    })
+    .sort((a, b) => {
+      const at = a.lastTs || 0;
+      const bt = b.lastTs || 0;
+      return bt - at;
+    })
+    .map(c => ({
+      ...c,
+      // Limit messages sent to frontend for faster response
+      messages: [...c.messages].sort((a, b) => (a.ts || 0) - (b.ts || 0)).slice(-30),
+    }));
   res.json({ conversations: list });
 });
 
@@ -1031,7 +1214,7 @@ app.get("/api/conversations/:id/messages", async (req, res) => {
     const msgMap = new Map();
     for (const m of conv.messages) msgMap.set(m.id, m);
     for (const m of enriched) msgMap.set(m.id, m);
-    conv.messages = [...msgMap.values()].slice(-80);
+    conv.messages = [...msgMap.values()].sort((a, b) => (a.ts || 0) - (b.ts || 0)).slice(-80);
     const lastMsg = conv.messages.at(-1);
     conv.lastTs = lastMsg ? (lastMsg.ts || 0) : 0;
     conversations.set(convId, conv);
@@ -1061,6 +1244,238 @@ app.post("/api/resolve-lids", async (_req, res) => {
   res.json({ ok: true, resolved, total: conversations.size });
 });
 
+// Shared LID resolution for all send endpoints
+async function resolveSendChatId(to, chatIdParam) {
+  let chatId = chatIdParam || (to.includes("@") ? to : `${to.replace(/\D/g, "")}@c.us`);
+  const cleanNum = chatId.replace(/[^0-9]/g, "");
+
+  // If already @lid, resolve to phone
+  if (chatId.endsWith("@lid")) {
+    const lidUser = chatId.replace(/@lid$/, "");
+    let resolvedPhone = await resolveLidToPhone(lidUser);
+    if (!resolvedPhone) {
+      const conv = conversations.get(chatId);
+      if (conv && conv.handle && conv.handle.replace(/\D/g, "").length >= 10 && conv.handle.replace(/\D/g, "").length <= 13) {
+        resolvedPhone = conv.handle;
+      }
+    }
+    if (!resolvedPhone) {
+      const lidName = conversations.get(chatId)?.name || "";
+      if (lidName) {
+        for (const [, c] of conversations) {
+          if (c.handle && c.name === lidName && c.handle.replace(/\D/g, "").length >= 10 && c.handle.replace(/\D/g, "").length <= 13) {
+            resolvedPhone = c.handle;
+            break;
+          }
+        }
+      }
+    }
+    if (resolvedPhone) {
+      const phoneChatId = `${resolvedPhone.replace(/\D/g, "")}@c.us`;
+      log("info", `LID resolvido: ${lidUser} -> ${phoneChatId}`);
+      return { chatId: phoneChatId, lidJid: null };
+    }
+    log("warn", `LID nao resolvido: ${lidUser}`);
+    return { chatId, lidJid: chatId };
+  }
+
+  // If @c.us, try to find the corresponding @lid in conversations
+  if (chatId.endsWith("@c.us")) {
+    const phone = cleanNum;
+    // Search conversations for a @lid entry with matching phone
+    for (const [lidJid, conv] of conversations) {
+      if (lidJid.endsWith("@lid") && conv.handle) {
+        const convPhone = conv.handle.replace(/\D/g, "");
+        if (convPhone === phone) {
+          log("info", `Encontrado @lid para ${chatId}: ${lidJid}`);
+          return { chatId: lidJid, lidJid };
+        }
+      }
+    }
+    // No @lid found — return as-is, sendTextWithFallback will handle the error
+    return { chatId, lidJid: null };
+  }
+
+  return { chatId, lidJid: null };
+}
+
+// Send text with LID fallback
+async function sendTextWithFallback(chatId, text) {
+  // First try: client.sendMessage
+  try {
+    return await client.sendMessage(chatId, text);
+  } catch (err) {
+    const msg = err?.message || String(err);
+    if (!msg.includes("No LID") && !msg.includes("lid")) throw err;
+    log("warn", `LID error no sendMessage para ${chatId}, tentando fallbacks`);
+  }
+
+  // Second try: open a new tab to force WhatsApp to load the contact (resolves LID)
+  const phone = chatId.replace(/@.*/, "");
+  let resolvedChatId = chatId;
+  try {
+    log("info", `Abrindo nova aba para carregar contato: ${phone}`);
+    const browser = client.pupPage.browser();
+    const newPage = await browser.newPage();
+    try {
+      await newPage.goto(`https://web.whatsapp.com/send?phone=${phone}`, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await new Promise(r => setTimeout(r, 6000));
+
+      // Check if a @lid JID was created for this contact
+      const lidFound = await newPage.evaluate(async (num) => {
+        try {
+          const Collections = window.require('WAWebCollections');
+          for (const [key, chat] of Collections.Chat) {
+            if (chat.id?._serialized?.endsWith('@lid')) {
+              const handle = chat.id.user || "";
+              if (handle === num) return chat.id._serialized;
+            }
+          }
+        } catch {}
+        return null;
+      }, phone);
+      if (lidFound) {
+        resolvedChatId = lidFound;
+        log("info", `LID resolvido via nova aba: ${resolvedChatId}`);
+      }
+    } finally {
+      await newPage.close().catch(() => {});
+    }
+  } catch (tabErr) {
+    log("warn", `Nova aba falhou: ${tabErr?.message}`);
+  }
+
+  // Third try: send with the resolved chatId (might be @lid now)
+  try {
+    if (resolvedChatId !== chatId) {
+      log("info", `Enviando com chatId resolvido: ${resolvedChatId}`);
+      return await client.sendMessage(resolvedChatId, text);
+    }
+  } catch (err2) {
+    log("warn", `Envio com ${resolvedChatId} falhou: ${err2?.message}`);
+  }
+
+  // Fourth try: browser context with WWebJS
+  const result = await client.pupPage.evaluate(async (jid, textToSend) => {
+    try {
+      const chat = await window.WWebJS.getChat(jid, { getAsModel: false });
+      if (chat) {
+        const m = await chat.sendMessage(textToSend);
+        return m?.id?._serialized || m?._serialized || "";
+      }
+    } catch (e) { /* continue */ }
+
+    try {
+      const WidFactory = window.require('WAWebWidFactory');
+      const FindChat = window.require('WAWebFindChatAction');
+      const wid = WidFactory.createWid(jid);
+      const found = await FindChat.findOrCreateLatestChat(wid);
+      if (found?.chat) {
+        const m = await found.chat.sendMessage(textToSend);
+        return m?.id?._serialized || m?._serialized || "";
+      }
+    } catch (e) { /* continue */ }
+
+    throw new Error("Contato nao encontrado: " + jid);
+  }, chatId, text);
+  return { id: { _serialized: result } };
+}
+
+// Send media with LID fallback
+async function sendMediaWithFallback(chatId, media, options = {}) {
+  try {
+    return await client.sendMessage(chatId, media, options);
+  } catch (err) {
+    const msg = err?.message || String(err);
+    if (!msg.includes("No LID") && !msg.includes("lid")) throw err;
+    log("warn", `LID error media para ${chatId}, tentando fallbacks`);
+  }
+
+  // Try new tab to resolve LID
+  const phone = chatId.replace(/@.*/, "");
+  let resolvedChatId = chatId;
+  try {
+    const browser = client.pupPage.browser();
+    const newPage = await browser.newPage();
+    try {
+      await newPage.goto(`https://web.whatsapp.com/send?phone=${phone}`, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await new Promise(r => setTimeout(r, 6000));
+      const lidFound = await newPage.evaluate(async (num) => {
+        try {
+          const Collections = window.require('WAWebCollections');
+          for (const [key, chat] of Collections.Chat) {
+            if (chat.id?._serialized?.endsWith('@lid')) {
+              const handle = chat.id.user || "";
+              if (handle === num) return chat.id._serialized;
+            }
+          }
+        } catch {}
+        return null;
+      }, phone);
+      if (lidFound) {
+        resolvedChatId = lidFound;
+        log("info", `LID resolvido via nova aba (media): ${resolvedChatId}`);
+      }
+    } finally {
+      await newPage.close().catch(() => {});
+    }
+  } catch (tabErr) {
+    log("warn", `Nova aba falhou (media): ${tabErr?.message}`);
+  }
+
+  // Try send with resolved chatId
+  try {
+    if (resolvedChatId !== chatId) {
+      return await client.sendMessage(resolvedChatId, media, options);
+    }
+  } catch (err2) {
+    log("warn", `Envio media com ${resolvedChatId} falhou: ${err2?.message}`);
+  }
+
+  // Browser context fallback
+  log("warn", `LID error media, tentando envio direto: ${chatId}`);
+  const b64Data = typeof media === "string" ? media : (media.data || "");
+  const mime = typeof media === "string" ? (options.mimeType || "application/octet-stream") : (media.mimetype || "application/octet-stream");
+  const fname = typeof media === "string" ? "file" : (media.filename || "file");
+  const result = await client.pupPage.evaluate(async (jid, data, mimeType, filename, opts) => {
+    const binaryStr = atob(data);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+    const blob = new Blob([bytes], { type: mimeType });
+    const file = new File([blob], filename, { type: mimeType, lastModified: Date.now() });
+    const mediaType = opts.isVoice ? "audio" : (mimeType.startsWith("video") ? "video" : "image");
+    const mediaInfo = { mimetype: mimeType, file, data, type: mediaType, filesize: file.size };
+    if (opts.isVoice) mediaInfo.isVoice = true;
+    const mediaOptions = await window.WWebJS.processMediaData(mediaInfo, {
+      forceSticker: false, forceGif: false, forceVoice: !!opts.isVoice,
+      forceDocument: !!opts.sendMediaAsDocument, forceMediaHd: false,
+      sendToChannel: false, sendToStatus: false,
+    });
+    if (opts.isVoice) mediaOptions.isPtt = true;
+    if (opts.caption) mediaOptions.caption = opts.caption;
+
+    try {
+      const chat = await window.WWebJS.getChat(jid, { getAsModel: false });
+      if (chat) {
+        const msg = await window.WWebJS.sendMessage(chat, undefined, mediaOptions);
+        return msg?.id?._serialized || jid;
+      }
+    } catch (e1) { /* continue */ }
+
+    const WidFactory = window.require('WAWebWidFactory');
+    const FindChat = window.require('WAWebFindChatAction');
+    const wid = WidFactory.createWid(jid);
+    const found = await FindChat.findOrCreateLatestChat(wid);
+    if (found?.chat) {
+      const msg = await window.WWebJS.sendMessage(found.chat, undefined, mediaOptions);
+      return msg?.id?._serialized || jid;
+    }
+
+    throw new Error("Chat nao encontrado: " + jid);
+  }, chatId, b64Data, mime, fname, options);
+  return { id: { _serialized: result } };
+}
+
 app.post("/api/send", async (req, res) => {
   try {
     if (!client) return res.status(503).json({ error: "cliente_nao_iniciado" });
@@ -1072,14 +1487,13 @@ app.post("/api/send", async (req, res) => {
     const chatIdParam = String(req.body?.chatId || "").trim();
     if (!to || !text) return res.status(400).json({ error: "to e text obrigatorios" });
 
-    // Use chatId if provided (for @lid contacts), otherwise construct from 'to'
-    const chatId = chatIdParam || (to.includes("@") ? to : `${to.replace(/\D/g, "")}@c.us`);
+    const { chatId, lidJid } = await resolveSendChatId(to, chatIdParam);
 
     // Simulate typing before sending
     const typingMs = Number(req.body?.typingMs) || 0;
     await simulateTyping(chatId, typingMs);
 
-    const sent = await client.sendMessage(chatId, text);
+    const sent = await sendTextWithFallback(chatId, text);
     await ingestMessage(sent, "agent", false);
 
     log("info", `Enviado: ${text.substring(0, 50)} -> ${chatId}`);
@@ -1095,11 +1509,74 @@ function convertToOgg(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     execFile(ffmpegPath, [
       "-y",
+      "-vn",
       "-i", inputPath,
       "-c:a", "libopus",
-      "-b:a", "32k",
-      "-ar", "16000",
+      "-b:a", "48k",
+      "-ar", "48000",
       "-ac", "1",
+      "-application", "voip",
+      "-vbr", "on",
+      "-compression_level", "5",
+      "-frame_duration", "20",
+      "-f", "ogg",
+      outputPath,
+    ], { timeout: 15000 }, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+function convertToM4a(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    execFile(ffmpegPath, [
+      "-y",
+      "-vn",
+      "-i", inputPath,
+      "-c:a", "aac",
+      "-b:a", "64k",
+      "-ar", "44100",
+      "-ac", "1",
+      "-f", "ipod",
+      "-movflags", "+faststart",
+      outputPath,
+    ], { timeout: 15000 }, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+function convertToMp3(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    execFile(ffmpegPath, [
+      "-y",
+      "-vn",
+      "-i", inputPath,
+      "-c:a", "libmp3lame",
+      "-b:a", "64k",
+      "-ar", "44100",
+      "-ac", "1",
+      "-f", "mp3",
+      outputPath,
+    ], { timeout: 15000 }, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+function convertToWav(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    execFile(ffmpegPath, [
+      "-y",
+      "-vn",
+      "-i", inputPath,
+      "-c:a", "pcm_s16le",
+      "-ar", "44100",
+      "-ac", "1",
+      "-f", "wav",
       outputPath,
     ], { timeout: 15000 }, (err) => {
       if (err) reject(err);
@@ -1121,11 +1598,9 @@ app.post("/api/send-audio", async (req, res) => {
     const mimeType = String(req.body?.mimeType || "audio/webm").trim();
     if (!to || !audioBase64) return res.status(400).json({ error: "to e audio obrigatorios" });
 
-    const chatId = chatIdParam || (to.includes("@") ? to : `${to.replace(/\D/g, "")}@c.us`);
+    log("info", `Audio recebido: to=${to}, mimeType=${mimeType}, base64len=${audioBase64.length}`);
 
-    // Simulate typing before sending audio
-    const typingMs = Number(req.body?.typingMs) || 0;
-    await simulateTyping(chatId, typingMs);
+    const { chatId, lidJid } = await resolveSendChatId(to, chatIdParam);
 
     // Save input file
     const tmpDir = path.join(authPath, "..", ".wwebjs_audio");
@@ -1133,39 +1608,165 @@ app.post("/api/send-audio", async (req, res) => {
     const ts = Date.now();
     const ext = mimeType.includes("ogg") ? "ogg" : mimeType.includes("mp4") ? "m4a" : "webm";
     const inputFile = path.join(tmpDir, `input_${ts}.${ext}`);
-    const outputFile = path.join(tmpDir, `output_${ts}.ogg`);
-    tmpFiles.push(inputFile, outputFile);
+    tmpFiles.push(inputFile);
     const audioBuffer = Buffer.from(audioBase64, "base64");
     await fs.writeFile(inputFile, audioBuffer);
 
-    // Convert to OGG/Opus (WhatsApp voice format)
+    // Convert to OGG/Opus — WhatsApp requires OGG for voice messages
     let voiceFile = inputFile;
+    let voiceMime = mimeType;
+    const oggOutput = path.join(tmpDir, `output_${ts}.ogg`);
+    tmpFiles.push(oggOutput);
     try {
-      await convertToOgg(inputFile, outputFile);
-      voiceFile = outputFile;
-      log("info", `Convertido para OGG/Opus: ${audioBuffer.length} bytes`);
-    } catch (convErr) {
-      log("warn", "Conversao falhou, usando original", convErr?.message);
+      await convertToOgg(inputFile, oggOutput);
+      const stat = await fs.stat(oggOutput);
+      if (stat.size > 100) {
+        voiceFile = oggOutput;
+        voiceMime = "audio/ogg; codecs=opus";
+        log("info", `Convertido para OGG: ${stat.size} bytes`);
+      }
+    } catch (oggErr) {
+      log("warn", "Conversao OGG falhou", oggErr?.message);
     }
 
-    // Read converted file as base64 for playback in CRM
+    // Read for CRM playback
     let sentAudioUrl = null;
     try {
       const outBuf = await fs.readFile(voiceFile);
       sentAudioUrl = `data:audio/ogg;base64,${outBuf.toString("base64")}`;
     } catch {}
 
-    // Send as voice message
+    // Send audio — use WWebJS browser context with LID fallback
     let sent;
+    let audioChatId = chatId;
+    const outBuf = await fs.readFile(voiceFile);
+    const audioB64 = outBuf.toString("base64");
+
+    // LID resolution: open new tab to force WhatsApp to load the contact
+    if (chatId.endsWith("@c.us")) {
+      const phone = chatId.replace(/@.*/, "");
+      try {
+        const browser = client.pupPage.browser();
+        const newPage = await browser.newPage();
+        try {
+          await newPage.goto(`https://web.whatsapp.com/send?phone=${phone}`, { waitUntil: "domcontentloaded", timeout: 20000 });
+          await new Promise(r => setTimeout(r, 6000));
+          const lidFound = await newPage.evaluate(async (num) => {
+            try {
+              const Collections = window.require('WAWebCollections');
+              for (const [key, chat] of Collections.Chat) {
+                if (chat.id?._serialized?.endsWith('@lid')) {
+                  const handle = chat.id.user || "";
+                  if (handle === num) return chat.id._serialized;
+                }
+              }
+            } catch {}
+            return null;
+          }, phone);
+          if (lidFound) {
+            audioChatId = lidFound;
+            log("info", `LID resolvido via nova aba (audio): ${audioChatId}`);
+          }
+        } finally {
+          await newPage.close().catch(() => {});
+        }
+      } catch (tabErr) {
+        log("warn", `Nova aba falhou (audio): ${tabErr?.message}`);
+      }
+    }
+
+    // Strategy 1: Browser context with WWebJS (works for most contacts)
     try {
-      const media = MessageMedia.fromFilePath(voiceFile);
-      sent = await client.sendMessage(chatId, media, { sendAudioAsVoice: true });
-      log("info", `Audio enviado como voz -> ${chatId}`);
-    } catch (voiceErr) {
-      log("warn", "Envio como voz falhou, tentando anexo", voiceErr?.message);
-      const media = MessageMedia.fromFilePath(voiceFile);
-      sent = await client.sendMessage(chatId, media);
-      log("info", `Audio enviado como anexo -> ${chatId}`);
+      sent = await client.pupPage.evaluate(async (jid, b64Data, mime) => {
+        const chat = await window.WWebJS.getChat(jid, { getAsModel: false });
+        if (!chat) throw new Error("Chat nao encontrado");
+        const binaryStr = atob(b64Data);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+        const blob = new Blob([bytes], { type: mime });
+        const file = new File([blob], "audio.ogg", { type: mime, lastModified: Date.now() });
+        const mediaInfo = {
+          mimetype: mime, file: file, filename: "audio.ogg",
+          data: b64Data, type: "audio", filesize: file.size, isVoice: true,
+        };
+        const mediaOptions = await window.WWebJS.processMediaData(mediaInfo, {
+          forceSticker: false, forceGif: false, forceVoice: true,
+          forceDocument: false, forceMediaHd: false,
+          sendToChannel: false, sendToStatus: false,
+        });
+        mediaOptions.isPtt = true;
+        const msg = await window.WWebJS.sendMessage(chat, undefined, mediaOptions);
+        return msg ? (msg.id?._serialized || "") : "";
+      }, audioChatId, audioB64, voiceMime);
+      sent = { id: { _serialized: sent } };
+      log("info", `Audio enviado (WWebJS) -> ${audioChatId} (${outBuf.length} bytes)`);
+    } catch (browserErr) {
+      const browserErrMsg = browserErr?.message || String(browserErr);
+      log("warn", `WWebJS falhou (${browserErrMsg}), tentando envio interno`);
+
+      // Strategy 2: Internal WAWeb modules (bypasses LID resolution)
+      try {
+        sent = await client.pupPage.evaluate(async (jid, b64Data, mime) => {
+          const WidFactory = window.require('WAWebWidFactory');
+          const Collections = window.require('WAWebCollections');
+          const FindChat = window.require('WAWebFindChatAction');
+          const SendMsg = window.require('WAWebSendMsgChatAction');
+          const MsgKey = window.require('WAWebMsgKey');
+          const MeUser = window.require('WAWebUserPrefsMeUser');
+
+          const wid = WidFactory.createWid(jid);
+          let chat = Collections.Chat.get(wid);
+          if (!chat) {
+            const found = await FindChat.findOrCreateLatestChat(wid);
+            chat = found?.chat;
+          }
+          if (!chat) throw new Error("Chat nao encontrado: " + jid);
+
+          const binaryStr = atob(b64Data);
+          const bytes = new Uint8Array(binaryStr.length);
+          for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+          const blob = new Blob([bytes], { type: mime });
+          const file = new File([blob], "audio.ogg", { type: mime, lastModified: Date.now() });
+          const mediaInfo = {
+            mimetype: mime, file: file, filename: "audio.ogg",
+            data: b64Data, type: "audio", filesize: file.size, isVoice: true,
+          };
+          const mediaOptions = await window.WWebJS.processMediaData(mediaInfo, {
+            forceSticker: false, forceGif: false, forceVoice: true,
+            forceDocument: false, forceMediaHd: false,
+            sendToChannel: false, sendToStatus: false,
+          });
+          mediaOptions.isPtt = true;
+
+          const from = MeUser.getMaybeMePnUser();
+          const newId = await MsgKey.newId();
+          const newMsgKey = new MsgKey({ from, to: chat.id, id: newId, selfDir: 'out' });
+          const message = {
+            id: newMsgKey, ack: 0, from, to: chat.id,
+            self: 'out', t: Math.floor(Date.now() / 1000), isNewMsg: true,
+            isMedia: true, type: 'audio', ...mediaOptions,
+          };
+          const [msgPromise] = SendMsg.addAndSendMsgToChat(chat, message);
+          await msgPromise;
+          return newMsgKey._serialized;
+        }, audioChatId, audioB64, voiceMime);
+        sent = { id: { _serialized: sent } };
+        log("info", `Audio enviado (interno) -> ${audioChatId}`);
+      } catch (internalErr) {
+        log("warn", "Envio interno falhou, tentando MessageMedia", internalErr?.message);
+        // Strategy 3: MessageMedia voice
+        try {
+          const media = new MessageMedia(voiceMime, audioB64, "audio.ogg");
+          sent = await client.sendMessage(audioChatId, media, { sendAudioAsVoice: true });
+          log("info", `Audio enviado (MessageMedia voice) -> ${audioChatId}`);
+        } catch (voiceErr) {
+          log("warn", "MessageMedia voice falhou, tentando documento", voiceErr?.message);
+          // Strategy 4: MessageMedia document
+          const media = new MessageMedia(voiceMime, audioB64, "audio.ogg");
+          sent = await client.sendMessage(audioChatId, media, { sendMediaAsDocument: true });
+          log("info", `Audio enviado como documento -> ${audioChatId}`);
+        }
+      }
     }
 
     // Register message in conversations with audioUrl for playback
@@ -1195,14 +1796,14 @@ app.post("/api/send-image", async (req, res) => {
     const caption = String(req.body?.caption || "").trim();
     if (!to || !imageBase64) return res.status(400).json({ error: "to e imageBase64 obrigatorios" });
 
-    const chatId = chatIdParam || (to.includes("@") ? to : `${to.replace(/\D/g, "")}@c.us`);
+    const { chatId, lidJid } = await resolveSendChatId(to, chatIdParam);
 
     // Simulate typing before sending image
     const typingMs = Number(req.body?.typingMs) || 0;
     await simulateTyping(chatId, typingMs);
 
     const media = new MessageMedia(mimeType, imageBase64);
-    const sent = await client.sendMessage(chatId, media, { caption: caption || undefined });
+    const sent = await sendMediaWithFallback(chatId, media, { caption: caption || undefined, mimeType });
     await ingestMessage(sent, "agent", false);
 
     log("info", `Imagem enviada -> ${chatId}${caption ? ` (${caption})` : ""}`);
@@ -1227,14 +1828,14 @@ app.post("/api/send-video", async (req, res) => {
     const caption = String(req.body?.caption || "").trim();
     if (!to || !videoBase64) return res.status(400).json({ error: "to e videoBase64 obrigatorios" });
 
-    const chatId = chatIdParam || (to.includes("@") ? to : `${to.replace(/\D/g, "")}@c.us`);
+    const { chatId, lidJid } = await resolveSendChatId(to, chatIdParam);
 
     // Simulate typing before sending video
     const typingMs = Number(req.body?.typingMs) || 0;
     await simulateTyping(chatId, typingMs);
 
     const media = new MessageMedia(mimeType, videoBase64);
-    const sent = await client.sendMessage(chatId, media, { caption: caption || undefined });
+    const sent = await sendMediaWithFallback(chatId, media, { caption: caption || undefined, mimeType });
     await ingestMessage(sent, "agent", false);
 
     log("info", `Video enviado -> ${chatId}${caption ? ` (${caption})` : ""}`);
@@ -1332,6 +1933,30 @@ app.post("/api/flows/stop", (req, res) => {
   if (!chatId) return res.status(400).json({ error: "chatId obrigatorio" });
   stopFlowExecution(chatId);
   res.json({ ok: true });
+});
+
+// ── SSE: Real-time event stream for frontend ──
+app.get("/api/events", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write(":\n\n"); // initial heartbeat
+  sseClients.add(res);
+  log("info", `SSE client connected (${sseClients.size} total)`);
+
+  // Keep-alive heartbeat every 15s to prevent proxy/browser timeout
+  const heartbeat = setInterval(() => {
+    try { res.write(":\n\n"); } catch { clearInterval(heartbeat); sseClients.delete(res); }
+  }, 15000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+    log("info", `SSE client disconnected (${sseClients.size} total)`);
+  });
 });
 
 // ── Error handlers ──
